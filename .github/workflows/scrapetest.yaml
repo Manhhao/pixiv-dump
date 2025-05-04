@@ -1,0 +1,135 @@
+name: Scrape All
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get time of 5.9 hours from now
+        id: get_time_details
+        run: |
+          echo "::set-output name=time_nextrun::$(($(date +%s) + 21240))"
+          
+      - name: Download DB from latest release
+        run: |
+          mkdir -p db
+          LATEST_URL=$(curl --silent https://api.github.com/repos/${{ github.repository }}/releases/latest \
+            | jq -r '.assets[] | select(.name == "pixiv.db") | .browser_download_url')
+          echo "Downloading from $LATEST_URL"
+          curl -L -o db/pixiv.db -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" "$LATEST_URL"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Create db/pixiv.db if it doesn't exist
+        run: |
+          if [ ! -f db/pixiv.db ]; then
+            npx prisma migrate dev
+          fi
+
+      - name: Set up DB
+        run: npm run migrate
+
+      - name: Build
+        run: npm run build
+
+      - name: Get seconds until next run
+        id: get_seconds_until_nextrun
+        # prettier-ignore
+        run: echo "::set-output name=seconds::$((${{ steps.get_time_details.outputs.time_nextrun }} - $(date +%s)))"
+
+      - name: Get ms until next run
+        id: get_ms_until_nextrun
+        # prettier-ignore
+        run: echo "::set-output name=ms::$((${{ steps.get_seconds_until_nextrun.outputs.seconds }} * 1000))"
+
+      - name: Scrape
+        run: node . --timeout=${{ steps.get_ms_until_nextrun.outputs.ms }}
+
+      - name: Upload DB
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: db
+          path: db/*
+
+      - name: Check if total.txt exists
+        id: check_file
+        run: |
+          if [[ -f total.txt ]]; then
+            echo "::set-output name=completed::true"
+          else
+            echo "::set-output name=completed::false"
+          fi
+
+      - name: Upload total.txt if it exists
+        if: steps.check_file.outputs.completed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: total
+          path: total.txt
+
+  release:
+    runs-on: ubuntu-latest
+    needs: scrape
+    # if: ${{ needs.scrape.outputs.completed == 'true' }}
+    steps:
+      - name: Get Current Date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+
+      - name: Download DB
+        uses: actions/download-artifact@v4
+        with:
+          name: db
+          path: db
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+
+      - name: Download total.txt
+        uses: actions/download-artifact@v4
+        with:
+          name: total
+          path: total
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+        continue-on-error: true
+
+      - name: Read Total Count from total.txt
+        id: read_total
+        run: |
+          if [[ -f total/total.txt ]]; then
+            TOTAL=$(cat total/total.txt)
+          else
+            TOTAL=''
+          fi
+          echo "Total: $TOTAL"
+          echo "::set-output name=total::$TOTAL"
+
+      - name: Set release body
+        id: set_body
+        run: |
+          if [[ "${{ steps.read_total.outputs.total }}" != "" ]]; then
+            echo "::set-output name=body::Total entries in DB: ${{ steps.read_total.outputs.total }}"
+          else
+            echo "::set-output name=body::Scraping of articles is still in progress."
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            db/pixiv.db
+          tag_name: ${{ steps.date.outputs.date }}
+          prerelease: ${{ steps.read_total.outputs.total == '' }}
+          body: ${{ steps.set_body.outputs.body }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
