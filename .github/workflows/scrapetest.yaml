@@ -1,4 +1,4 @@
-name: Scrape All
+name: Scrape Test
 
 on:
   schedule:
